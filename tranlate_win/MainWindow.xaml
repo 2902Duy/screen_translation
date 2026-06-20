@@ -1,0 +1,72 @@
+<Window x:Class="ScreenTranslator.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Screen Translator - Control Panel" 
+        Height="400" Width="360"
+        Background="#1E1E24" 
+        Foreground="#F5F5F5"
+        FontFamily="Segoe UI"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Closing="Window_Closing">
+    <Grid Margin="15">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Header -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,15">
+            <TextBlock Text="SCREEN TRANSLATOR" FontSize="20" FontWeight="Bold" Foreground="#FF007ACC"/>
+            <TextBlock Text="Dịch màn hình thời gian thực cực nhẹ" FontSize="11" Foreground="#8A8A8F" Margin="0,2,0,0"/>
+            <Separator Background="#2C2C35" Margin="0,10,0,0"/>
+        </StackPanel>
+        
+        <!-- Settings -->
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <!-- Source Lang -->
+                <TextBlock Text="Ngôn ngữ nguồn (OCR):" FontSize="12" Foreground="#8A8A8F" Margin="0,5,0,2"/>
+                <ComboBox x:Name="ComboSourceLang" Height="30" Margin="0,0,0,10" Foreground="Black"/>
+                
+                <!-- Target Lang -->
+                <TextBlock Text="Ngôn ngữ đích (Dịch sang):" FontSize="12" Foreground="#8A8A8F" Margin="0,5,0,2"/>
+                <ComboBox x:Name="ComboTargetLang" Height="30" Margin="0,0,0,10" Foreground="Black"/>
+                
+                <!-- Auto-scan toggle -->
+                <CheckBox x:Name="CheckAutoScan" Content="Bật tự động quét (Auto-scan)" FontSize="13" Foreground="#F5F5F5" Margin="0,10,0,5" Checked="CheckAutoScan_Checked" Unchecked="CheckAutoScan_Unchecked"/>
+                
+                <!-- Auto-scan Interval -->
+                <StackPanel x:Name="PanelInterval" Margin="20,0,0,10" Visibility="Collapsed">
+                    <DockPanel>
+                        <TextBlock Text="Chu kỳ quét: " FontSize="11" Foreground="#8A8A8F"/>
+                        <TextBlock x:Name="TextIntervalValue" Text="1.0s" FontSize="11" Foreground="#FF007ACC" HorizontalAlignment="Right"/>
+                    </DockPanel>
+                    <Slider x:Name="SliderInterval" Minimum="500" Maximum="5000" Value="1000" TickFrequency="100" IsSnapToTickEnabled="True" Margin="0,5,0,0" ValueChanged="SliderInterval_ValueChanged"/>
+                </StackPanel>
+
+                <!-- Hotkey display -->
+                <TextBlock Text="Phím tắt hệ thống:" FontSize="12" Foreground="#8A8A8F" Margin="0,10,0,2"/>
+                <Border Background="#10FFFFFF" BorderBrush="#2C2C35" BorderThickness="1" Padding="10" CornerRadius="4">
+                    <StackPanel>
+                        <Grid Margin="0,2">
+                            <TextBlock Text="Vẽ vùng dịch mới:" FontSize="12" Foreground="#F5F5F5"/>
+                            <TextBlock Text="Ctrl + Shift + F" FontSize="12" FontWeight="Bold" Foreground="#FF007ACC" HorizontalAlignment="Right"/>
+                        </Grid>
+                        <Grid Margin="0,2">
+                            <TextBlock Text="Dịch lại vùng cũ:" FontSize="12" Foreground="#F5F5F5"/>
+                            <TextBlock Text="Ctrl + Shift + R" FontSize="12" FontWeight="Bold" Foreground="#FF007ACC" HorizontalAlignment="Right"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+        
+        <!-- Action Buttons -->
+        <StackPanel Grid.Row="2" Margin="0,15,0,0">
+            <Button x:Name="BtnSelectRegion" Content="CHỌN VÙNG DỊCH MỚI (Ctrl+Shift+F)" Height="35" Background="#FF007ACC" Foreground="White" FontWeight="Bold" BorderThickness="0" Click="BtnSelectRegion_Click"/>
+            <TextBlock x:Name="TextStatus" Text="Trạng thái: Chưa chọn vùng dịch" FontSize="11" Foreground="#8A8A8F" HorizontalAlignment="Center" Margin="0,8,0,0"/>
+        </StackPanel>
+    </Grid>
+</Window>
