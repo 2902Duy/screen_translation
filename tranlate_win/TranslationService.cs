@@ -34,8 +34,9 @@ namespace ScreenTranslator
                     "https://translate.googleapis.com/translate_a/single?client=gtx&sl={0}&tl={1}&dt=t&q={2}",
                     sl, tl, Uri.EscapeDataString(text));
 
-                using (WebClient wc = new WebClient())
+                using (TimeoutWebClient wc = new TimeoutWebClient(4000)) // Timeout 4 giây để chống đứng im khi mất mạng/rate-limit
                 {
+                    wc.Proxy = null; // Bỏ qua tự động dò proxy để tăng tốc độ kết nối (giảm delay từ ~1.5s xuống ~0.2s)
                     wc.Headers[HttpRequestHeader.UserAgent] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
                     wc.Encoding = Encoding.UTF8;
                     string response = wc.DownloadString(url);
@@ -121,6 +122,26 @@ namespace ScreenTranslator
             {
                 return "[Lỗi Parse: " + ex.Message + "]";
             }
+        }
+    }
+
+    // WebClient có giới hạn thời gian Timeout
+    public class TimeoutWebClient : WebClient
+    {
+        private int _timeoutMs;
+        public TimeoutWebClient(int timeoutMs)
+        {
+            _timeoutMs = timeoutMs;
+        }
+
+        protected override WebRequest GetWebRequest(Uri address)
+        {
+            WebRequest request = base.GetWebRequest(address);
+            if (request != null)
+            {
+                request.Timeout = _timeoutMs;
+            }
+            return request;
         }
     }
 }

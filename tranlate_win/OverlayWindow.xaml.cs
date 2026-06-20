@@ -19,8 +19,12 @@ namespace ScreenTranslator
         [DllImport("user32.dll")]
         private static extern int SetWindowLong(IntPtr hwnd, int index, int newStyle);
 
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
+
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_TRANSPARENT = 0x00000020;
+        private const uint WDA_EXCLUDEFROMCAPTURE = 0x00000011;
 
         public System.Drawing.Rectangle SelectedRect { get; set; }
         public string SourceLanguage { get; set; }
@@ -30,9 +34,12 @@ namespace ScreenTranslator
         private double _dpiY = 1.0;
 
         private bool _isAutoScanning = false;
-        private Bitmap _lastCapturedBmp = null;
         private int _scanIntervalMs = 1000;
         private bool _isTranslating = false;
+        private string _lastLayoutSignature = string.Empty;
+        private string _lastTextSignature = string.Empty;
+        private Dictionary<string, string> _translationCache = new Dictionary<string, string>();
+        private byte[] _lastLowResPixels = null;
 
         public OverlayWindow(System.Drawing.Rectangle rect, string sourceLang, string targetLang)
         {
@@ -65,6 +72,16 @@ namespace ScreenTranslator
             var helper = new WindowInteropHelper(this);
             int extendedStyle = GetWindowLong(helper.Handle, GWL_EXSTYLE);
             SetWindowLong(helper.Handle, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT);
+
+            // Ẩn cửa sổ hiển thị dịch này khỏi tất cả các phần mềm quay/chụp màn hình (để tránh tự dịch chính nó)
+            try
+            {
+                SetWindowDisplayAffinity(helper.Handle, WDA_EXCLUDEFROMCAPTURE);
+            }
+            catch (Exception ex)
+            {
+                Log("SetWindowDisplayAffinity failed: " + ex.Message);
+            }
         }
 
         private void Log(string msg)
@@ -77,34 +94,173 @@ namespace ScreenTranslator
             catch {}
         }
 
-        // Thực hiện chụp màn hình và dịch
+        private static bool HasAlphanumeric(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (char.IsLetterOrDigit(text[i]))
+                    return true;
+            }
+            return false;
+        }
+
+        // Lấy mẫu ảnh thu nhỏ 16x16 để so sánh nhanh sự thay đổi điểm ảnh
+        private byte[] GetLowResPixels(Bitmap bmp)
+        {
+            using (Bitmap small = new Bitmap(16, 16, System.Drawing.Imaging.PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g = Graphics.FromImage(small))
+                {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
+                    g.DrawImage(bmp, 0, 0, 16, 16);
+                }
+                
+                System.Drawing.Imaging.BitmapData data = small.LockBits(new Rectangle(0, 0, 16, 16), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                try
+                {
+                    int bytes = data.Stride * 16;
+                    byte[] pixels = new byte[bytes];
+                    System.Runtime.InteropServices.Marshal.Copy(data.Scan0, pixels, 0, bytes);
+                    return pixels;
+                }
+                finally
+                {
+                    small.UnlockBits(data);
+                }
+            }
+        }
+
+        // Kiểm tra xem màn hình có thay đổi pixel nào đáng kể không
+        private bool HasScreenChanged(byte[] current, byte[] last)
+        {
+            if (last == null || current == null) return true;
+            if (current.Length != last.Length) return true;
+            
+            for (int i = 0; i < current.Length; i++)
+            {
+                if (current[i] != last[i])
+                    return true;
+            }
+            return false;
+        }
+
+        // Thực hiện chụp màn hình và dịch (thủ công)
         public async Task TranslateAsync()
         {
             if (_isTranslating) return;
-            _isTranslating = true;
 
             Log("TranslateAsync triggered. ROI Rect: " + SelectedRect.X + "," + SelectedRect.Y + "," + SelectedRect.Width + "x" + SelectedRect.Height);
 
             Dispatcher.Invoke(() => {
+                OverlayCanvas.Children.Clear(); // Xóa sạch chữ dịch cũ ngay lập tức khi dịch thủ công
                 LoadingIndicator.Visibility = Visibility.Visible;
             });
 
             try
             {
-                Bitmap bmp = OcrService.CaptureScreen(SelectedRect.Left, SelectedRect.Top, SelectedRect.Width, SelectedRect.Height);
+                Bitmap bmp = await Task.Run(() => OcrService.CaptureScreen(SelectedRect.Left, SelectedRect.Top, SelectedRect.Width, SelectedRect.Height));
                 Log("Screen captured successfully.");
-                await TranslateWithBitmapAsync(bmp);
+
+                // Lưu mẫu pixel độ phân giải thấp cho lần quét thủ công này
+                _lastLowResPixels = GetLowResPixels(bmp);
                 
-                // Lưu lại bitmap hiện tại để phục vụ so sánh ở Auto-scan
-                if (_lastCapturedBmp != null)
+                var lines = await Task.Run(() => OcrService.RecognizeText(bmp, SourceLanguage));
+                bmp.Dispose(); // Giải phóng ảnh ngay lập tức sau khi OCR xong
+                
+                // Cập nhật các signature để đồng bộ hóa với auto-scan (đã lọc ký tự rác)
+                StringBuilder sbText = new StringBuilder();
+                StringBuilder sbLayout = new StringBuilder();
+                if (lines != null)
                 {
-                    _lastCapturedBmp.Dispose();
+                    foreach (var line in lines)
+                    {
+                        if (HasAlphanumeric(line.Text))
+                        {
+                            sbText.Append(line.Text).Append("|");
+                            int rx = (int)(Math.Round(line.X / 3.0) * 3);
+                            int ry = (int)(Math.Round(line.Y / 3.0) * 3);
+                            sbLayout.Append(line.Text).Append("@").Append(rx).Append(",").Append(ry).Append("|");
+                        }
+                    }
                 }
-                _lastCapturedBmp = bmp;
+                _lastTextSignature = sbText.ToString();
+                _lastLayoutSignature = sbLayout.ToString();
+
+                if (lines != null && lines.Count > 0)
+                {
+                    await TranslateWithOcrLinesAsync(lines);
+                }
+                else
+                {
+                    Dispatcher.Invoke(() => {
+                        OverlayCanvas.Children.Clear();
+                        LoadingIndicator.Visibility = Visibility.Collapsed;
+                    });
+                }
             }
             catch (Exception ex)
             {
                 Log("TranslateAsync ERROR: " + ex.Message + "\n" + ex.StackTrace);
+                Dispatcher.Invoke(() => {
+                    LoadingIndicator.Visibility = Visibility.Collapsed;
+                });
+            }
+        }
+
+        // Tiến trình xử lý chính dựa trên danh sách dòng chữ đã có sẵn từ OCR
+        private async Task TranslateWithOcrLinesAsync(List<OcrTextLine> lines)
+        {
+            _isTranslating = true;
+            Log("TranslateWithOcrLinesAsync started. Lines: " + lines.Count);
+
+            try
+            {
+                // 1. Gom các dòng chữ lại để dịch trong 1 request duy nhất (tối ưu hóa API)
+                StringBuilder sbSource = new StringBuilder();
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    sbSource.Append(lines[i].Text);
+                    if (i < lines.Count - 1)
+                        sbSource.Append("\n");
+                }
+
+                Log("Merged source text:\n" + sbSource.ToString());
+
+                // Gửi API dịch
+                Log("Requesting Google Translate (From: " + SourceLanguage + ", To: " + TargetLanguage + ")...");
+                string translatedTextRaw = await Task.Run(() => 
+                    TranslationService.Translate(sbSource.ToString(), SourceLanguage, TargetLanguage));
+                Log("Translation response received:\n" + translatedTextRaw);
+
+                // Tách các dòng dịch tương ứng
+                string[] translatedLines = translatedTextRaw.Split(new[] { '\n' }, StringSplitOptions.None);
+                Log("Translated lines count: " + translatedLines.Length);
+
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    if (i < translatedLines.Length)
+                    {
+                        lines[i].TranslatedText = translatedLines[i].Trim();
+                    }
+                    else
+                    {
+                        lines[i].TranslatedText = lines[i].Text; // Fallback
+                    }
+
+                    // Lưu vào cache dịch thuật
+                    if (!string.IsNullOrEmpty(lines[i].Text))
+                    {
+                        _translationCache[lines[i].Text] = lines[i].TranslatedText;
+                    }
+                }
+
+                // 2. Vẽ đè lên Canvas
+                DrawTranslationLines(lines);
+            }
+            catch (Exception ex)
+            {
+                Log("TranslateWithOcrLinesAsync ERROR: " + ex.Message + "\n" + ex.StackTrace);
             }
             finally
             {
@@ -115,57 +271,9 @@ namespace ScreenTranslator
             }
         }
 
-        // Tiến trình xử lý chính dựa trên hình ảnh chụp được
-        private async Task TranslateWithBitmapAsync(Bitmap bmp)
+        // Tách biệt logic vẽ chữ dịch lên Canvas (chạy đồng bộ trên UI thread)
+        private void DrawTranslationLines(List<OcrTextLine> lines)
         {
-            Log("TranslateWithBitmapAsync started.");
-            // 1. Nhận diện OCR lấy text và bounding box
-            var lines = await Task.Run(() => OcrService.RecognizeText(bmp, SourceLanguage));
-            if (lines == null || lines.Count == 0)
-            {
-                Log("No text lines recognized by OCR.");
-                Dispatcher.Invoke(() => {
-                    OverlayCanvas.Children.Clear();
-                });
-                return;
-            }
-
-            Log("Recognized " + lines.Count + " lines. Merging text for translation...");
-
-            // 2. Gom các dòng chữ lại để dịch trong 1 request duy nhất (tối ưu hóa API)
-            StringBuilder sbSource = new StringBuilder();
-            for (int i = 0; i < lines.Count; i++)
-            {
-                sbSource.Append(lines[i].Text);
-                if (i < lines.Count - 1)
-                    sbSource.Append("\n");
-            }
-
-            Log("Merged source text:\n" + sbSource.ToString());
-
-            // Gửi API dịch
-            Log("Requesting Google Translate (From: " + SourceLanguage + ", To: " + TargetLanguage + ")...");
-            string translatedTextRaw = await Task.Run(() => 
-                TranslationService.Translate(sbSource.ToString(), SourceLanguage, TargetLanguage));
-            Log("Translation response received:\n" + translatedTextRaw);
-
-            // Tách các dòng dịch tương ứng
-            string[] translatedLines = translatedTextRaw.Split(new[] { '\n' }, StringSplitOptions.None);
-            Log("Translated lines count: " + translatedLines.Length);
-
-            for (int i = 0; i < lines.Count; i++)
-            {
-                if (i < translatedLines.Length)
-                {
-                    lines[i].TranslatedText = translatedLines[i].Trim();
-                }
-                else
-                {
-                    lines[i].TranslatedText = lines[i].Text; // Fallback
-                }
-            }
-
-            // 3. Vẽ đè lên Canvas
             Log("Vẽ đè lên Canvas bắt đầu. Dòng cần vẽ: " + lines.Count);
             Dispatcher.Invoke(() => {
                 OverlayCanvas.Children.Clear();
@@ -181,10 +289,11 @@ namespace ScreenTranslator
                     double wpfW = line.Width / _dpiX;
                     double wpfH = line.Height / _dpiY;
 
-                    // 3.1 Dò màu nền của hộp chữ gốc
-                    System.Windows.Media.Color bgColor = SampleBackgroundColor(bmp, (int)line.X, (int)line.Y, (int)line.Width, (int)line.Height);
+                    // Sử dụng màu nền đã được dò sẵn trên luồng phụ
+                    System.Drawing.Color gdiColor = line.BackgroundColor;
+                    System.Windows.Media.Color bgColor = System.Windows.Media.Color.FromArgb(gdiColor.A, gdiColor.R, gdiColor.G, gdiColor.B);
                     
-                    // 3.2 Quyết định màu chữ dựa trên độ sáng màu nền (Luminance) để tăng độ tương phản
+                    // Quyết định màu chữ dựa trên độ sáng màu nền (Luminance) để tăng độ tương phản
                     double luminance = 0.299 * bgColor.R + 0.587 * bgColor.G + 0.114 * bgColor.B;
                     var textColor = luminance > 128 
                         ? new SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 30, 30)) 
@@ -193,7 +302,7 @@ namespace ScreenTranslator
                     Log(string.Format("Vẽ chữ: '{0}' -> '{1}' tại ({2},{3}) [{4}x{5}], BG Color: {6}", 
                         line.Text, line.TranslatedText, wpfX, wpfY, wpfW, wpfH, bgColor.ToString()));
 
-                    // 3.3 Tạo Border đè lên chữ cũ
+                    // Tạo Border đè lên chữ cũ
                     Border border = new Border
                     {
                         Width = wpfW + 6,
@@ -203,7 +312,7 @@ namespace ScreenTranslator
                         Padding = new Thickness(2)
                     };
 
-                    // 3.4 Tạo TextBlock chữ dịch
+                    // Tạo TextBlock chữ dịch
                     TextBlock textBlock = new TextBlock
                     {
                         Text = line.TranslatedText,
@@ -236,48 +345,6 @@ namespace ScreenTranslator
             });
         }
 
-        // Thuật toán lấy mẫu dò màu nền ở viền bounding box
-        private System.Windows.Media.Color SampleBackgroundColor(Bitmap bmp, int x, int y, int w, int h)
-        {
-            int maxX = bmp.Width - 1;
-            int maxY = bmp.Height - 1;
-
-            List<System.Drawing.Color> colors = new List<System.Drawing.Color>();
-            
-            Action<int, int> addPixel = (px, py) => {
-                int cx = Math.Max(0, Math.Min(px, maxX));
-                int cy = Math.Max(0, Math.Min(py, maxY));
-                colors.Add(bmp.GetPixel(cx, cy));
-            };
-
-            // Lấy mẫu 4 góc của bounding box
-            addPixel(x, y);
-            addPixel(x + w - 1, y);
-            addPixel(x, y + h - 1);
-            addPixel(x + w - 1, y + h - 1);
-
-            // Lấy mẫu 4 điểm trung vị ở biên
-            addPixel(x + w / 2, y);
-            addPixel(x + w / 2, y + h - 1);
-            addPixel(x, y + h / 2);
-            addPixel(x + w - 1, y + h / 2);
-
-            // Tính màu trung bình
-            int sumR = 0, sumG = 0, sumB = 0;
-            foreach (var c in colors)
-            {
-                sumR += c.R;
-                sumG += c.G;
-                sumB += c.B;
-            }
-
-            byte avgR = (byte)(sumR / colors.Count);
-            byte avgG = (byte)(sumG / colors.Count);
-            byte avgB = (byte)(sumB / colors.Count);
-
-            return System.Windows.Media.Color.FromRgb(avgR, avgG, avgB);
-        }
-
         // Bắt đầu vòng lặp quét Auto-scan
         public async void StartAutoScan(int intervalMs)
         {
@@ -295,28 +362,87 @@ namespace ScreenTranslator
 
                 try
                 {
-                    Bitmap currentBmp = OcrService.CaptureScreen(SelectedRect.Left, SelectedRect.Top, SelectedRect.Width, SelectedRect.Height);
+                    // Chụp ảnh màn hình ở luồng phụ để không block UI Thread
+                    Bitmap currentBmp = await Task.Run(() => OcrService.CaptureScreen(SelectedRect.Left, SelectedRect.Top, SelectedRect.Width, SelectedRect.Height));
                     
-                    if (HasScreenChanged(currentBmp, _lastCapturedBmp))
+                    // So sánh nhanh pixel độ phân giải thấp để xem có thay đổi gì trên màn hình không (Tier 1)
+                    byte[] currentLowRes = GetLowResPixels(currentBmp);
+                    if (!HasScreenChanged(currentLowRes, _lastLowResPixels))
                     {
-                        // Màn hình thay đổi rõ rệt -> thực hiện dịch
-                        await TranslateWithBitmapAsync(currentBmp);
-                        
-                        if (_lastCapturedBmp != null)
-                        {
-                            _lastCapturedBmp.Dispose();
-                        }
-                        _lastCapturedBmp = currentBmp;
-                    }
-                    else
-                    {
-                        // Không đổi -> giải phóng ảnh mới chụp
                         currentBmp.Dispose();
+                        continue;
+                    }
+                    _lastLowResPixels = currentLowRes;
+                    
+                    // 1. Chạy OCR cục bộ trước (rất nhanh, ~30ms, offline hoàn toàn, không tốn mạng)
+                    var lines = await Task.Run(() => OcrService.RecognizeText(currentBmp, SourceLanguage));
+                    currentBmp.Dispose(); // Giải phóng ảnh ngay lập tức sau khi OCR xong
+                    
+                    // 2. Tạo chữ ký đại diện cho nội dung chữ và vị trí (đã lọc ký tự rác)
+                    StringBuilder sbText = new StringBuilder();
+                    StringBuilder sbLayout = new StringBuilder();
+                    if (lines != null)
+                    {
+                        foreach (var line in lines)
+                        {
+                            if (HasAlphanumeric(line.Text))
+                            {
+                                sbText.Append(line.Text).Append("|");
+                                int rx = (int)(Math.Round(line.X / 3.0) * 3);
+                                int ry = (int)(Math.Round(line.Y / 3.0) * 3);
+                                sbLayout.Append(line.Text).Append("@").Append(rx).Append(",").Append(ry).Append("|");
+                            }
+                        }
+                    }
+                    string currentTextSig = sbText.ToString();
+                    string currentLayoutSig = sbLayout.ToString();
+
+                    // 3. Kiểm tra thay đổi bố cục/vị trí hoặc nội dung chữ
+                    if (currentLayoutSig != _lastLayoutSignature)
+                    {
+                        _lastLayoutSignature = currentLayoutSig;
+
+                        if (lines != null && lines.Count > 0)
+                        {
+                            // 4. Nếu vị trí thay đổi nhưng NỘI DUNG CHỮ vẫn giữ nguyên, dịch offline từ Cache lập tức (Không gọi API dịch)
+                            if (currentTextSig == _lastTextSignature)
+                            {
+                                Log("Text signature matches. Updating text coordinates offline from cache.");
+                                foreach (var line in lines)
+                                {
+                                    string translatedText;
+                                    if (_translationCache.TryGetValue(line.Text, out translatedText))
+                                    {
+                                        line.TranslatedText = translatedText;
+                                    }
+                                    else
+                                    {
+                                        line.TranslatedText = line.Text;
+                                    }
+                                }
+                                // Vẽ lại vị trí mới ngay lập tức
+                                DrawTranslationLines(lines);
+                            }
+                            else
+                            {
+                                // Nếu nội dung chữ thực sự thay đổi, gọi API dịch mới
+                                _lastTextSignature = currentTextSig;
+                                await TranslateWithOcrLinesAsync(lines);
+                            }
+                        }
+                        else
+                        {
+                            // Nếu không có chữ nào, xóa sạch canvas ngay lập tức
+                            _lastTextSignature = currentTextSig;
+                            Dispatcher.Invoke(() => {
+                                OverlayCanvas.Children.Clear();
+                            });
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine("Auto-scan loop error: " + ex.Message);
+                    Log("Auto-scan loop error: " + ex.Message + "\n" + ex.StackTrace);
                 }
             }
         }
@@ -327,58 +453,9 @@ namespace ScreenTranslator
             _isAutoScanning = false;
         }
 
-        // Thuật toán Pixel Change Detection để kiểm tra màn hình thay đổi
-        private bool HasScreenChanged(Bitmap bmp1, Bitmap bmp2)
-        {
-            if (bmp1 == null || bmp2 == null) return true;
-            if (bmp1.Width != bmp2.Width || bmp1.Height != bmp2.Height) return true;
-
-            // Thu nhỏ cả 2 bitmap về 32x32 pixel để loại bỏ nhiễu răng cưa và so sánh cực nhanh
-            using (Bitmap small1 = ResizeBitmap(bmp1, 32, 32))
-            using (Bitmap small2 = ResizeBitmap(bmp2, 32, 32))
-            {
-                double totalDiff = 0;
-                int totalPixels = 32 * 32;
-
-                for (int x = 0; x < 32; x++)
-                {
-                    for (int y = 0; y < 32; y++)
-                    {
-                        var c1 = small1.GetPixel(x, y);
-                        var c2 = small2.GetPixel(x, y);
-
-                        // Tính tổng độ lệch màu
-                        totalDiff += Math.Abs(c1.R - c2.R) + Math.Abs(c1.G - c2.G) + Math.Abs(c1.B - c2.B);
-                    }
-                }
-
-                // Độ lệch trung bình của mỗi kênh màu trên mỗi pixel (thang 0-255)
-                double avgDiff = totalDiff / (totalPixels * 3.0);
-                
-                // Nếu độ lệch lớn hơn 5.0 (tương đương thay đổi khoảng 2% pixel), coi như có thay đổi
-                return avgDiff > 5.0;
-            }
-        }
-
-        private Bitmap ResizeBitmap(Bitmap src, int width, int height)
-        {
-            Bitmap result = new Bitmap(width, height);
-            using (Graphics g = Graphics.FromImage(result))
-            {
-                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
-                g.DrawImage(src, 0, 0, width, height);
-            }
-            return result;
-        }
-
         private void OverlayWindow_Closed(object sender, EventArgs e)
         {
             StopAutoScan();
-            if (_lastCapturedBmp != null)
-            {
-                _lastCapturedBmp.Dispose();
-            }
-            _lastCapturedBmp = null;
         }
     }
 }

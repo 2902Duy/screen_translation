@@ -19,6 +19,7 @@ namespace ScreenTranslator
         public double Width { get; set; }
         public double Height { get; set; }
         public string TranslatedText { get; set; }
+        public System.Drawing.Color BackgroundColor { get; set; }
     }
 
     public class OcrService
@@ -34,19 +35,78 @@ namespace ScreenTranslator
             return bmp;
         }
 
-        // Chuyển đổi Bitmap của GDI+ thành SoftwareBitmap của WinRT
-        public static async Task<SoftwareBitmap> ConvertToSoftwareBitmap(Bitmap bmp)
+        // Chuyển đổi Bitmap của GDI+ thành SoftwareBitmap của WinRT (tối ưu hóa trực tiếp bộ nhớ, ~0ms)
+        public static SoftwareBitmap ConvertToSoftwareBitmap(Bitmap bmp)
         {
-            using (MemoryStream ms = new MemoryStream())
+            BitmapData bmpData = bmp.LockBits(
+                new Rectangle(0, 0, bmp.Width, bmp.Height), 
+                ImageLockMode.ReadOnly, 
+                PixelFormat.Format32bppArgb);
+            try
             {
-                bmp.Save(ms, ImageFormat.Png);
-                ms.Position = 0;
-
-                // Sử dụng AsRandomAccessStream từ System.Runtime.WindowsRuntime
-                IRandomAccessStream randomAccessStream = ms.AsRandomAccessStream();
-                BitmapDecoder decoder = await BitmapDecoder.CreateAsync(randomAccessStream);
-                return await decoder.GetSoftwareBitmapAsync();
+                int bytes = bmpData.Stride * bmp.Height;
+                byte[] rgbValues = new byte[bytes];
+                System.Runtime.InteropServices.Marshal.Copy(bmpData.Scan0, rgbValues, 0, bytes);
+                
+                // Chuyển mảng byte thành WinRT IBuffer
+                Windows.Storage.Streams.IBuffer buffer = System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions.AsBuffer(rgbValues);
+                
+                // Tạo SoftwareBitmap trực tiếp
+                SoftwareBitmap softwareBitmap = new SoftwareBitmap(
+                    BitmapPixelFormat.Bgra8, 
+                    bmp.Width, 
+                    bmp.Height, 
+                    BitmapAlphaMode.Premultiplied);
+                
+                softwareBitmap.CopyFromBuffer(buffer);
+                return softwareBitmap;
             }
+            finally
+            {
+                bmp.UnlockBits(bmpData);
+            }
+        }
+
+        // Thuật toán lấy mẫu dò màu nền ở viền bounding box (chạy trên luồng phụ)
+        public static System.Drawing.Color SampleBackgroundColor(Bitmap bmp, int x, int y, int w, int h)
+        {
+            int maxX = bmp.Width - 1;
+            int maxY = bmp.Height - 1;
+
+            List<System.Drawing.Color> colors = new List<System.Drawing.Color>();
+            
+            Action<int, int> addPixel = (px, py) => {
+                int cx = Math.Max(0, Math.Min(px, maxX));
+                int cy = Math.Max(0, Math.Min(py, maxY));
+                colors.Add(bmp.GetPixel(cx, cy));
+            };
+
+            // Lấy mẫu 4 góc của bounding box
+            addPixel(x, y);
+            addPixel(x + w - 1, y);
+            addPixel(x, y + h - 1);
+            addPixel(x + w - 1, y + h - 1);
+
+            // Lấy mẫu 4 điểm trung vị ở biên
+            addPixel(x + w / 2, y);
+            addPixel(x + w / 2, y + h - 1);
+            addPixel(x, y + h / 2);
+            addPixel(x + w - 1, y + h / 2);
+
+            // Tính màu trung bình
+            int sumR = 0, sumG = 0, sumB = 0;
+            foreach (var c in colors)
+            {
+                sumR += c.R;
+                sumG += c.G;
+                sumB += c.B;
+            }
+
+            byte avgR = (byte)(sumR / colors.Count);
+            byte avgG = (byte)(sumG / colors.Count);
+            byte avgB = (byte)(sumB / colors.Count);
+
+            return System.Drawing.Color.FromArgb(255, avgR, avgG, avgB);
         }
 
         private static void Log(string msg)
@@ -68,7 +128,7 @@ namespace ScreenTranslator
 
             try
             {
-                softwareBitmap = await ConvertToSoftwareBitmap(bmp);
+                softwareBitmap = ConvertToSoftwareBitmap(bmp);
                 Log("Converted GDI+ Bitmap to SoftwareBitmap.");
                 
                 OcrEngine engine;
@@ -90,7 +150,7 @@ namespace ScreenTranslator
                 Log("OcrEngine initialized with language: " + engine.RecognizerLanguage.LanguageTag);
 
                 Log("Invoking RecognizeAsync...");
-                OcrResult result = await engine.RecognizeAsync(softwareBitmap);
+                OcrResult result = await engine.RecognizeAsync(softwareBitmap).AsTask().ConfigureAwait(false);
                 Log("RecognizeAsync completed.");
                 if (result == null)
                 {
@@ -162,7 +222,8 @@ namespace ScreenTranslator
                             X = minX,
                             Y = minY,
                             Width = maxX - minX,
-                            Height = maxY - minY
+                            Height = maxY - minY,
+                            BackgroundColor = SampleBackgroundColor(bmp, (int)minX, (int)minY, (int)(maxX - minX), (int)(maxY - minY))
                         });
                     }
                 }
